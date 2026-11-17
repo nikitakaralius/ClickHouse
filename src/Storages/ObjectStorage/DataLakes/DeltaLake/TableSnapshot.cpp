@@ -19,7 +19,6 @@
 #include <Common/ThreadPool.h>
 #include <Common/ThreadStatus.h>
 #include <Common/ThreadGroupSwitcher.h>
-#include <Common/escapeForFileName.h>
 #include <Common/setThreadName.h>
 
 #include <IO/ReadBufferFromString.h>
@@ -30,7 +29,6 @@
 #include <Storages/ObjectStorage/DataLakes/DeltaLake/getSchemaFromSnapshot.h>
 #include <Storages/ObjectStorage/DataLakes/DeltaLake/PartitionPruner.h>
 #include <Storages/ObjectStorage/DataLakes/DeltaLake/KernelUtils.h>
-#include <Storages/ObjectStorage/DataLakes/Common/Common.h>
 #include <Storages/ObjectStorage/DataLakes/DeltaLake/ExpressionVisitor.h>
 #include <Storages/ObjectStorage/DataLakes/DeltaLake/EnginePredicate.h>
 #include <Storages/ObjectStorage/Utils.h>
@@ -86,9 +84,9 @@ struct DataObjectInfo : public DB::ObjectInfo
     {
     }
 
-    std::shared_ptr<DB::ObjectInfo> clone() const override { return std::make_shared<DataObjectInfo>(*this); }
+    [[nodiscard]] std::shared_ptr<DB::ObjectInfo> clone() const override { return std::make_shared<DataObjectInfo>(*this); }
 
-    std::optional<size_t> getFileSizeHint() const override
+    [[nodiscard]] std::optional<size_t> getFileSizeHint() const override
     {
         if (size > 0)
             return static_cast<size_t>(size);
@@ -130,6 +128,7 @@ public:
         const TableSchema & table_schema_,
         const DB::NameToNameMap & physical_names_map_,
         const DB::Names & partition_columns_,
+        const DeltaTimestampColumns & timestamp_columns_,
         const DB::ActionsDAG * filter_,
         DB::IDataLakeMetadata::FileProgressCallback callback_,
         size_t list_batch_size_,
@@ -157,6 +156,7 @@ public:
         if (filter_)
         {
             filter = filter_->clone();
+            timestamp_columns = timestamp_columns_;
             pruner.emplace(
                 *filter,
                 table_schema_,
@@ -203,8 +203,6 @@ public:
             thread.join();
     }
 
-    const std::string & getDataPath() const { return helper->getDataPath(); }
-
     const std::string & getTableLocation() const { return helper->getTableLocation(); }
 
     /// Called on the scanning thread. Under the mutex, so that `next` does not miss the notification between
@@ -223,7 +221,7 @@ public:
     {
         if (filter.has_value() && enable_engine_predicate)
         {
-            auto predicate = getEnginePredicate(filter.value(), engine_predicate_exception, getContext());
+            auto predicate = getEnginePredicate(filter.value(), engine_predicate_exception, getContext(), timestamp_columns);
             scan = KernelUtils::unwrapResult(
                 ffi::scan(
                     kernel_snapshot_state->snapshot.get(),
@@ -632,8 +630,7 @@ public:
 
         ProfileEvents::increment(ProfileEvents::DeltaLakeScannedFiles);
 
-        std::string full_path = DB::resolvePathInsideTable(
-            context->getDataPath(), DB::unescapeForFileName(KernelUtils::fromDeltaString(path)));
+        std::string full_path = context->helper->resolveDataFilePath(KernelUtils::fromDeltaString(path), context->getContext());
         auto object = std::make_shared<DataObjectInfo>(std::move(full_path), size);
         object->data_lake_metadata.emplace();
         if (stats)
@@ -675,6 +672,8 @@ private:
     KernelScanDataIterator scan_data_iterator;
     std::optional<PartitionPruner> pruner;
     std::optional<DB::ActionsDAG> filter;
+    /// For the engine predicate, see `TableSchemaResult`.
+    DeltaTimestampColumns timestamp_columns;
 
     KernelHelperPtr helper;
     DB::NamesAndTypesList read_schema;
@@ -1034,6 +1033,7 @@ DB::ObjectIterator TableSnapshot::iterate(
         schema->table_schema,
         schema->physical_names_map,
         schema->partition_columns,
+        schema->timestamp_columns,
         filter_dag,
         callback,
         list_batch_size,
@@ -1050,7 +1050,7 @@ void TableSnapshot::initOrUpdateSchemaIfChanged() const
     if (!schema.has_value())
     {
         auto state = getKernelSnapshotState();
-        auto [table_schema, physical_names_map, timestamp_ntz_paths]
+        auto [table_schema, physical_names_map, timestamp_ntz_paths, timestamp_columns]
             = getTableSchemaFromSnapshot(state->snapshot.get(), state->engine.get());
 
         if (table_schema.empty())
@@ -1079,6 +1079,7 @@ void TableSnapshot::initOrUpdateSchemaIfChanged() const
             .physical_names_map = std::move(physical_names_map),
             .partition_columns = std::move(partition_columns),
             .timestamp_ntz_paths = std::move(timestamp_ntz_paths),
+            .timestamp_columns = std::move(timestamp_columns),
         });
     }
 }
