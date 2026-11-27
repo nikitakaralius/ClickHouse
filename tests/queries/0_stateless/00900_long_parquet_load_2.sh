@@ -16,18 +16,6 @@ CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
 DATA_DIR=$CUR_DIR/data_parquet
 
-# TODO [parquet]: Known issues to investigate:
-
-# ClickHouse Parquet reader doesn't support such complex types, so I didn't burrow into the issue.
-# There is failure due parsing nested arrays or nested maps with NULLs:
-# ../contrib/arrow/cpp/src/arrow/array/array_nested.cc:192:  Check failed: (self->list_type_->value_type()->id()) == (data->child_data[0]->type->id())
-
-# Strange behaviour for repeated_no_annotation.parquet around __buitin_expect, so this file was disabled:
-# debug:
-#   ../contrib/arrow/cpp/src/arrow/array/array_nested.cc:193:  Check failed: self->list_type_->value_type()->Equals(data->child_data[0]->type)
-# release:
-#   Code: 349. DB::Ex---tion: Can not insert NULL data into non-nullable column "phoneNumbers": data for INSERT was parsed from stdin
-
 EXCLUDE=(
     # These have extremely long strings and blow up the output.
     list_monotonically_increasing_offsets.parquet
@@ -110,6 +98,9 @@ EXCLUDE=(
     05443_int96_out_of_range.parquet
     # `INT96` timestamp on the lower boundary day of the `DateTime64(9)` range, tested by 05444.
     05444_int96_lower_boundary.parquet
+    # `INT96` fixtures of the 05627 Delta Lake pruning test; the first one is beyond the `DateTime64(9)` range.
+    05627_int96_beyond_int64_nanoseconds.parquet
+    05627_int96_before_epoch_sub_microsecond.parquet
     # Hand-crafted `DELTA_BINARY_PACKED` file for the 05479 filter-in-decoder test.
     05479_delta_binary_packed_filter_int8.parquet
 )

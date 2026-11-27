@@ -12,6 +12,7 @@
 #include <Storages/ObjectStorage/DataLakes/IDataLakeMetadata.h>
 #include <Storages/ObjectStorage/DataLakes/DeltaLake/KernelPointerWrapper.h>
 #include <Storages/ObjectStorage/DataLakes/DeltaLake/KernelHelper.h>
+#include <Storages/ObjectStorage/DataLakes/DeltaLake/getSchemaFromSnapshot.h>
 #include <boost/noncopyable.hpp>
 #include <Poco/JSON/Array.h>
 #include <unordered_set>
@@ -68,12 +69,12 @@ public:
 private:
     class Iterator;
 
-    using KernelExternEngine = KernelPointerWrapper<ffi::SharedExternEngine, ffi::free_engine>;
-    using KernelSnapshot = KernelPointerWrapper<ffi::SharedSnapshot, ffi::free_snapshot>;
-    using KernelScan = KernelPointerWrapper<ffi::SharedScan, ffi::free_scan>;
-    using KernelScanMetadataIterator = KernelPointerWrapper<ffi::SharedScanMetadataIterator, ffi::free_scan_metadata_iter>;
-    using KernelDvInfo = KernelPointerWrapper<ffi::SharedDvInfo, ffi::free_kernel_dv_info>;
-    using KernelExpression = KernelPointerWrapper<ffi::SharedExpression, ffi::free_kernel_expression>;
+    using KernelExternEngine = KernelPointerWrapper<::SharedExternEngine, ::free_engine>;
+    using KernelSnapshot = KernelPointerWrapper<::SharedSnapshot, ::free_snapshot>;
+    using KernelScan = KernelPointerWrapper<::SharedScan, ::free_scan>;
+    using KernelScanMetadataIterator = KernelPointerWrapper<::SharedScanMetadataIterator, ::free_scan_metadata_iter>;
+    using KernelDvInfo = KernelPointerWrapper<::SharedDvInfo, ::free_kernel_dv_info>;
+    using KernelExpression = KernelPointerWrapper<::SharedExpression, ::free_kernel_expression>;
 
     using TableSchema = DB::NamesAndTypesList;
     using ReadSchema = DB::NamesAndTypesList;
@@ -110,6 +111,8 @@ private:
         /// Partition columns list (not stored in read schema)
         DB::Names partition_columns;
         std::unordered_set<String> timestamp_ntz_paths;
+        /// See `TableSchemaResult`.
+        DeltaTimestampColumns timestamp_columns;
     };
     mutable std::optional<SchemaInfo> schema;
 

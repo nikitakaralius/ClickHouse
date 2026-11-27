@@ -19,7 +19,6 @@
 #include <Common/ThreadPool.h>
 #include <Common/ThreadStatus.h>
 #include <Common/ThreadGroupSwitcher.h>
-#include <Common/escapeForFileName.h>
 #include <Common/setThreadName.h>
 
 #include <IO/ReadBufferFromString.h>
@@ -27,10 +26,10 @@
 #include <IO/WriteHelpers.h>
 #include <Interpreters/Context.h>
 
+#include <Storages/ObjectStorage/DataLakes/DeltaLake/DataObjectInfo.h>
 #include <Storages/ObjectStorage/DataLakes/DeltaLake/getSchemaFromSnapshot.h>
 #include <Storages/ObjectStorage/DataLakes/DeltaLake/PartitionPruner.h>
 #include <Storages/ObjectStorage/DataLakes/DeltaLake/KernelUtils.h>
-#include <Storages/ObjectStorage/DataLakes/Common/Common.h>
 #include <Storages/ObjectStorage/DataLakes/DeltaLake/ExpressionVisitor.h>
 #include <Storages/ObjectStorage/DataLakes/DeltaLake/EnginePredicate.h>
 #include <Storages/ObjectStorage/Utils.h>
@@ -72,31 +71,10 @@ namespace
 
 /// A file's `numRecords` statistic counts rows that a deletion vector still logically removes,
 /// so it is not a row count for such a file.
-bool hasDeletionVector(ffi::SharedDvInfo * dv_info_ptr)
+bool hasDeletionVector(::SharedDvInfo * dv_info_ptr)
 {
-    return dv_info_ptr && ffi::dv_info_has_vector(dv_info_ptr);
+    return dv_info_ptr && ::dv_info_has_vector(dv_info_ptr);
 }
-
-/// A data file with the size its `add` action records.
-struct DataObjectInfo : public DB::ObjectInfo
-{
-    DataObjectInfo(std::string path_, int64_t size_)
-        : DB::ObjectInfo(DB::RelativePathWithMetadata(std::move(path_)))
-        , size(size_)
-    {
-    }
-
-    std::shared_ptr<DB::ObjectInfo> clone() const override { return std::make_shared<DataObjectInfo>(*this); }
-
-    std::optional<size_t> getFileSizeHint() const override
-    {
-        if (size > 0)
-            return static_cast<size_t>(size);
-        return std::nullopt;
-    }
-
-    const int64_t size;
-};
 
 }
 
@@ -130,6 +108,7 @@ public:
         const TableSchema & table_schema_,
         const DB::NameToNameMap & physical_names_map_,
         const DB::Names & partition_columns_,
+        const DeltaTimestampColumns & timestamp_columns_,
         const DB::ActionsDAG * filter_,
         DB::IDataLakeMetadata::FileProgressCallback callback_,
         size_t list_batch_size_,
@@ -144,6 +123,7 @@ public:
         , captured_credentials_fingerprint(helper_->getCredentialsFingerprint())
         , helper(helper_)
         , read_schema(read_schema_)
+        , table_schema(table_schema_)
         , expression_schema(table_schema_)
         , partition_columns(partition_columns_)
         , callback(callback_)
@@ -157,6 +137,7 @@ public:
         if (filter_)
         {
             filter = filter_->clone();
+            timestamp_columns = timestamp_columns_;
             pruner.emplace(
                 *filter,
                 table_schema_,
@@ -173,8 +154,14 @@ public:
 
         if (!physical_names_map_.empty())
         {
-            for (auto & [name, value] : expression_schema)
-                name = getPhysicalName(appendToLogicalPath({}, name), physical_names_map_);
+            /// The fields of structs have physical names too, as in the columns read from the data files: a requested
+            /// subcolumn (e.g. `c-t.c-t-x` for `t.x`) is found by its physical name in the type of the transform output.
+            for (auto & [name, type] : expression_schema)
+            {
+                const auto logical_path = appendToLogicalPath({}, name);
+                name = getPhysicalName(logical_path, physical_names_map_);
+                type = replaceTypeNamesToPhysicalRecursively(type, logical_path, name, physical_names_map_);
+            }
 
             for (auto & name : partition_columns)
                 name = getPhysicalName(appendToLogicalPath({}, name), physical_names_map_);
@@ -203,8 +190,6 @@ public:
             thread.join();
     }
 
-    const std::string & getDataPath() const { return helper->getDataPath(); }
-
     const std::string & getTableLocation() const { return helper->getTableLocation(); }
 
     /// Called on the scanning thread. Under the mutex, so that `next` does not miss the notification between
@@ -223,9 +208,9 @@ public:
     {
         if (filter.has_value() && enable_engine_predicate)
         {
-            auto predicate = getEnginePredicate(filter.value(), engine_predicate_exception, getContext());
+            auto predicate = getEnginePredicate(filter.value(), engine_predicate_exception, getContext(), table_schema, timestamp_columns);
             scan = KernelUtils::unwrapResult(
-                ffi::scan(
+                ::scan(
                     kernel_snapshot_state->snapshot.get(),
                     kernel_snapshot_state->engine.get(),
                     predicate.get(),
@@ -235,7 +220,7 @@ public:
         else
         {
             scan = KernelUtils::unwrapResult(
-                ffi::scan(
+                ::scan(
                     kernel_snapshot_state->snapshot.get(),
                     kernel_snapshot_state->engine.get(),
                     /* predicate */nullptr,
@@ -244,7 +229,7 @@ public:
         }
 
         scan_data_iterator = KernelUtils::unwrapResult(
-            ffi::scan_metadata_iter_init(kernel_snapshot_state->engine.get(), scan.get()),
+            ::scan_metadata_iter_init(kernel_snapshot_state->engine.get(), scan.get()),
             "scan_metadata_iter_init");
     }
 
@@ -327,7 +312,7 @@ public:
                     while (!shutdown.load())
                     {
                         bool have_scan_data_res = KernelUtils::unwrapResult(
-                            ffi::scan_metadata_next(scan_data_iterator.get(), this, visitData),
+                            ::scan_metadata_next(scan_data_iterator.get(), this, visitData),
                             "scan_metadata_next");
 
                         if (have_scan_data_res)
@@ -491,19 +476,19 @@ public:
         auto & metadata = object->data_lake_metadata;
         chassert(metadata.has_value());
 
-        if (auto * dv_info_ptr = scan_item.dv_info_handle.get(); dv_info_ptr && ffi::dv_info_has_vector(dv_info_ptr))
+        if (auto * dv_info_ptr = scan_item.dv_info_handle.get(); dv_info_ptr && ::dv_info_has_vector(dv_info_ptr))
         {
             /// `row_indexes_from_dv` returns a vector of row indexes
             /// that should be *removed* from the result set
-            ffi::KernelRowIndexArray row_indexes = KernelUtils::unwrapResult(
-                ffi::row_indexes_from_dv(
+            ::KernelRowIndexArray row_indexes = KernelUtils::unwrapResult(
+                ::row_indexes_from_dv(
                     dv_info_ptr,
                     kernel_snapshot_state->engine.get(),
                     KernelUtils::toDeltaString(getTableLocation())),
                 "row_indexes_from_dv");
 
             SCOPE_EXIT({
-                ffi::free_row_indexes(row_indexes);
+                ::free_row_indexes(row_indexes);
             });
 
             if (row_indexes.len > 0)
@@ -522,19 +507,19 @@ public:
 
     static void visitData(
         void * engine_context,
-        ffi::SharedScanMetadata * scan_metadata)
+        ::SharedScanMetadata * scan_metadata)
     {
         auto * iter = static_cast<Iterator *>(engine_context);
         /// Release the handle on all exit paths to avoid leaking it.
         SCOPE_EXIT({
-            ffi::free_scan_metadata(scan_metadata);
+            ::free_scan_metadata(scan_metadata);
         });
         /// Runs inside Rust's `scan_metadata_next`: a C++ exception must not cross the `extern "C"`
         /// frame, so store it (like `scanCallback`) and let `scanDataFunc` rethrow after it returns.
         try
         {
             KernelUtils::unwrapResult(
-                ffi::visit_scan_metadata(
+                ::visit_scan_metadata(
                     scan_metadata,
                     iter->kernel_snapshot_state->engine.get(),
                     engine_context,
@@ -549,14 +534,14 @@ public:
     }
 
     static bool scanCallback(
-        ffi::NullableCvoid engine_context,
-        struct ffi::KernelStringSlice path,
+        ::NullableCvoid engine_context,
+        struct ::KernelStringSlice path,
         int64_t size,
         int64_t /*mod_time*/,
-        const ffi::Stats * stats,
-        ffi::SharedDvInfo * dv_info,
-        ffi::OptionalValue<ffi::SharedExpression *> transform,
-        const struct ffi::CStringMap * deprecated)
+        const ::Stats * stats,
+        ::SharedDvInfo * dv_info,
+        ::SharedExpression * transform,
+        const struct ::CStringMap * deprecated)
     {
         try
         {
@@ -575,19 +560,19 @@ public:
     }
 
     static bool scanCallbackImpl(
-        ffi::NullableCvoid engine_context,
-        struct ffi::KernelStringSlice path,
+        ::NullableCvoid engine_context,
+        struct ::KernelStringSlice path,
         int64_t size,
-        const ffi::Stats * stats,
-        ffi::SharedDvInfo * dv_info,
-        ffi::OptionalValue<ffi::SharedExpression *> transform,
-        const struct ffi::CStringMap * /* deprecated */)
+        const ::Stats * stats,
+        ::SharedDvInfo * dv_info,
+        ::SharedExpression * transform,
+        const struct ::CStringMap * /* deprecated */)
     {
         /// Wrap handles in RAII immediately to ensure cleanup on any exit path
         KernelDvInfo dv_info_handle(dv_info);
         std::optional<KernelExpression> transform_handle;
-        if (transform.tag == ffi::OptionalValue<ffi::SharedExpression *>::Tag::Some)
-            transform_handle.emplace(transform.some._0);
+        if (transform)
+            transform_handle.emplace(transform);
 
         /// Read before `dv_info_handle` is moved into `data_files` below.
         const bool has_deletion_vector = hasDeletionVector(dv_info_handle.get());
@@ -632,9 +617,10 @@ public:
 
         ProfileEvents::increment(ProfileEvents::DeltaLakeScannedFiles);
 
-        std::string full_path = DB::resolvePathInsideTable(
-            context->getDataPath(), DB::unescapeForFileName(KernelUtils::fromDeltaString(path)));
-        auto object = std::make_shared<DataObjectInfo>(std::move(full_path), size);
+        std::string full_path = context->helper->resolveDataFilePath(KernelUtils::fromDeltaString(path), context->getContext());
+        DB::ObjectInfoPtr object = size > 0
+            ? std::make_shared<DB::ObjectInfoWithFileSizeHint>(DB::RelativePathWithMetadata(std::move(full_path)), static_cast<size_t>(size))
+            : std::make_shared<DB::ObjectInfo>(DB::RelativePathWithMetadata(std::move(full_path)));
         object->data_lake_metadata.emplace();
         if (stats)
             object->data_lake_metadata->num_rows = stats->num_records;
@@ -661,8 +647,8 @@ public:
     }
 
 private:
-    using KernelScan = KernelPointerWrapper<ffi::SharedScan, ffi::free_scan>;
-    using KernelScanDataIterator = KernelPointerWrapper<ffi::SharedScanMetadataIterator, ffi::free_scan_metadata_iter>;
+    using KernelScan = KernelPointerWrapper<::SharedScan, ::free_scan>;
+    using KernelScanDataIterator = KernelPointerWrapper<::SharedScanMetadataIterator, ::free_scan_metadata_iter>;
 
     std::shared_ptr<KernelSnapshotState> kernel_snapshot_state;
     /// Fingerprint of the credentials embedded in `kernel_snapshot_state` at build time.
@@ -675,9 +661,13 @@ private:
     KernelScanDataIterator scan_data_iterator;
     std::optional<PartitionPruner> pruner;
     std::optional<DB::ActionsDAG> filter;
+    /// For the engine predicate, see `TableSchemaResult`.
+    DeltaTimestampColumns timestamp_columns;
 
     KernelHelperPtr helper;
     DB::NamesAndTypesList read_schema;
+    /// The logical schema of the table, for the engine predicate.
+    const DB::NamesAndTypesList table_schema;
     DB::NamesAndTypesList expression_schema;
     DB::Names partition_columns;
     const DB::IDataLakeMetadata::FileProgressCallback callback;
@@ -771,7 +761,7 @@ TableSnapshot::SnapshotStats TableSnapshot::getSnapshotStatsImpl() const
 
     KernelScan fallback_scan;
     fallback_scan = KernelUtils::unwrapResult(
-        ffi::scan(
+        ::scan(
             state->snapshot.get(),
             state->engine.get(),
             /* predicate */nullptr,
@@ -780,15 +770,15 @@ TableSnapshot::SnapshotStats TableSnapshot::getSnapshotStatsImpl() const
 
     KernelScanMetadataIterator fallback_scan_data_iterator;
     fallback_scan_data_iterator = KernelUtils::unwrapResult(
-        ffi::scan_metadata_iter_init(
+        ::scan_metadata_iter_init(
             state->engine.get(), fallback_scan.get()),
         "scan_metadata_iter_init");
 
     struct StatsVisitor
     {
-        explicit StatsVisitor(ffi::SharedExternEngine * engine_) : engine(engine_) {}
+        explicit StatsVisitor(::SharedExternEngine * engine_) : engine(engine_) {}
 
-        ffi::SharedExternEngine * const engine;
+        ::SharedExternEngine * const engine;
         size_t total_data_files = 0;
         size_t total_bytes = 0;
         /// Not all writers add rows count to metadata
@@ -798,14 +788,14 @@ TableSnapshot::SnapshotStats TableSnapshot::getSnapshotStatsImpl() const
         std::exception_ptr exception;
 
         static bool visit(
-            ffi::NullableCvoid engine_context,
-            struct ffi::KernelStringSlice /* path */,
+            ::NullableCvoid engine_context,
+            struct ::KernelStringSlice /* path */,
             int64_t size,
             int64_t /* mod_time */,
-            const ffi::Stats * stats,
-            ffi::SharedDvInfo * dv_info,
-            ffi::OptionalValue<ffi::SharedExpression *> transform,
-            const struct ffi::CStringMap * /* deprecated */)
+            const ::Stats * stats,
+            ::SharedDvInfo * dv_info,
+            ::SharedExpression * transform,
+            const struct ::CStringMap * /* deprecated */)
         {
             /// Wrap handles in RAII immediately to ensure cleanup on any exit path
             /// TODO: Actually we do not need any transforms/dv_info to exist here,
@@ -813,8 +803,8 @@ TableSnapshot::SnapshotStats TableSnapshot::getSnapshotStatsImpl() const
             /// which will only collect stats.
             KernelDvInfo dv_info_handle(dv_info);
             std::optional<KernelExpression> transform_handle;
-            if (transform.tag == ffi::OptionalValue<ffi::SharedExpression *>::Tag::Some)
-                transform_handle.emplace(transform.some._0);
+            if (transform)
+                transform_handle.emplace(transform);
 
             auto * visitor = static_cast<StatsVisitor *>(engine_context);
             visitor->total_data_files += 1;
@@ -826,19 +816,19 @@ TableSnapshot::SnapshotStats TableSnapshot::getSnapshotStatsImpl() const
             return true;
         }
 
-        static void visitData(void * engine_context, ffi::SharedScanMetadata * scan_metadata)
+        static void visitData(void * engine_context, ::SharedScanMetadata * scan_metadata)
         {
             auto * visitor = static_cast<StatsVisitor *>(engine_context);
             /// Release the handle on all exit paths to avoid leaking it.
             SCOPE_EXIT({
-                ffi::free_scan_metadata(scan_metadata);
+                ::free_scan_metadata(scan_metadata);
             });
             /// Runs inside Rust's `scan_metadata_next`: a C++ exception must not cross the
             /// `extern "C"` frame, so store it and let the caller rethrow after the call returns.
             try
             {
                 KernelUtils::unwrapResult(
-                    ffi::visit_scan_metadata(
+                    ::visit_scan_metadata(
                         scan_metadata,
                         visitor->engine,
                         engine_context,
@@ -857,7 +847,7 @@ TableSnapshot::SnapshotStats TableSnapshot::getSnapshotStatsImpl() const
     while (true)
     {
         bool have_scan_data = KernelUtils::unwrapResult(
-            ffi::scan_metadata_next(
+            ::scan_metadata_next(
                 fallback_scan_data_iterator.get(),
                 &visitor,
                 StatsVisitor::visitData),
@@ -977,28 +967,28 @@ TableSnapshot::KernelSnapshotState::KernelSnapshotState(const IKernelHelper & he
     });
 
     auto * engine_builder = helper_.createBuilder();
-    engine = KernelUtils::unwrapResult(ffi::builder_build(engine_builder), "builder_build");
+    engine = KernelUtils::unwrapResult(::builder_build(engine_builder), "builder_build");
 
-    using KernelSnapshotBuilder = KernelPointerWrapper<ffi::MutableFfiSnapshotBuilder, ffi::free_snapshot_builder>;
+    using KernelSnapshotBuilder = KernelPointerWrapper<::MutableFfiSnapshotBuilder, ::free_snapshot_builder>;
     KernelSnapshotBuilder snapshot_builder(KernelUtils::unwrapResult(
-        ffi::get_snapshot_builder(
+        ::get_snapshot_builder(
             KernelUtils::toDeltaString(helper_.getTableLocation()),
             engine.get()),
         "get_snapshot_builder"));
     if (snapshot_version_.has_value())
     {
         auto * builder_handle = snapshot_builder.get();
-        ffi::snapshot_builder_set_version(&builder_handle, snapshot_version_.value());
+        ::snapshot_builder_set_version(&builder_handle, snapshot_version_.value());
     }
     /// `snapshot_builder_build` consumes the handle, so release() prevents the RAII destructor
     /// from double-freeing on success. The destructor still frees on early exception paths.
     snapshot = KernelUtils::unwrapResult(
-        ffi::snapshot_builder_build(snapshot_builder.release()),
+        ::snapshot_builder_build(snapshot_builder.release()),
         "snapshot_builder_build");
 
-    snapshot_version = ffi::version(snapshot.get());
+    snapshot_version = ::version(snapshot.get());
     scan = KernelUtils::unwrapResult(
-        ffi::scan(snapshot.get(), engine.get(), /* predicate */{}, /* engine_schema */nullptr),
+        ::scan(snapshot.get(), engine.get(), /* predicate */{}, /* engine_schema */nullptr),
         "scan");
 }
 
@@ -1034,6 +1024,7 @@ DB::ObjectIterator TableSnapshot::iterate(
         schema->table_schema,
         schema->physical_names_map,
         schema->partition_columns,
+        schema->timestamp_columns,
         filter_dag,
         callback,
         list_batch_size,
@@ -1050,7 +1041,7 @@ void TableSnapshot::initOrUpdateSchemaIfChanged() const
     if (!schema.has_value())
     {
         auto state = getKernelSnapshotState();
-        auto [table_schema, physical_names_map, timestamp_ntz_paths]
+        auto [table_schema, physical_names_map, timestamp_ntz_paths, timestamp_columns]
             = getTableSchemaFromSnapshot(state->snapshot.get(), state->engine.get());
 
         if (table_schema.empty())
@@ -1079,6 +1070,7 @@ void TableSnapshot::initOrUpdateSchemaIfChanged() const
             .physical_names_map = std::move(physical_names_map),
             .partition_columns = std::move(partition_columns),
             .timestamp_ntz_paths = std::move(timestamp_ntz_paths),
+            .timestamp_columns = std::move(timestamp_columns),
         });
     }
 }
